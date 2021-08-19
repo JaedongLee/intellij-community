@@ -62,6 +62,7 @@ public final class JShellHandler {
   private static final Logger LOG = Logger.getInstance(JShellHandler.class);
   private static final int DEBUG_PORT = -1;
   public static final Key<JShellHandler> MARKER_KEY = Key.create("JShell console key");
+  public static final String JSHELL_CONSOLE_KEY = "JShell console key";
   private static final Charset ourCharset = StandardCharsets.UTF_8;
 
   private static final Executor EXECUTOR = DefaultRunExecutor.getRunExecutorInstance();
@@ -76,6 +77,7 @@ public final class JShellHandler {
   private final ExecutorService myTaskQueue = SequentialTaskExecutor.createSequentialApplicationPoolExecutor(
     ExecutionBundle.message("jshell.command.queue"));
   private final AtomicReference<Collection<String>> myEvalClasspathRef = new AtomicReference<>(null);
+  private final Sdk mySdk;
 
   private JShellHandler(@NotNull Project project,
                         RunContentDescriptor descriptor,
@@ -86,6 +88,7 @@ public final class JShellHandler {
     myRunContent = descriptor;
     myConsoleView = view;
     myProcess = handler;
+    mySdk = SnippetEditorDecorator.getSdk(contentFile);
 
     final PipedInputStream is = new PipedInputStream();
     final OutputStreamWriter readerSink = new OutputStreamWriter(new PipedOutputStream(is), StandardCharsets.UTF_8);
@@ -113,7 +116,7 @@ public final class JShellHandler {
       public void processTerminated(@NotNull ProcessEvent event) {
         if (getAssociatedHandler(contentFile) == JShellHandler.this) {
           // process terminated either by closing file or by close action
-          contentFile.putUserData(MARKER_KEY, null);
+          contentFile.putUserData(createKey(mySdk), null);
           try {
             readerSink.close();
           }
@@ -133,14 +136,17 @@ public final class JShellHandler {
       }
     });
 
-    contentFile.putUserData(MARKER_KEY, this);
+    contentFile.putUserData(createKey(mySdk), this);
     view.attachToProcess(handler);
   }
 
   @Nullable
   public static JShellHandler getAssociatedHandler(VirtualFile contentFile) {
-    return contentFile != null? contentFile.getUserData(MARKER_KEY) : null;
+    Sdk sdk = SnippetEditorDecorator.getSdk(contentFile);
+    if (sdk == null) return null;
+    return contentFile.getUserData(createKey(sdk));
   }
+
 
   public static @NotNull JShellHandler create(@NotNull final Project project,
                                               @NotNull final VirtualFile contentFile,
@@ -508,5 +514,9 @@ public final class JShellHandler {
     public synchronized Throwable fillInStackTrace() {
       return this;
     }
+  }
+
+  private static Key<JShellHandler> createKey(Sdk sdk) {
+    return Key.create(JSHELL_CONSOLE_KEY + sdk.getVersionString());
   }
 }

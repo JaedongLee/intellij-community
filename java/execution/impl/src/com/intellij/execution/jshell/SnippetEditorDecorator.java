@@ -40,19 +40,38 @@ import java.util.List;
 public final class SnippetEditorDecorator extends EditorNotifications.Provider<SnippetEditorDecorator.ConfigurationPane>{
   public static final Key<ConfigurationPane> CONTEXT_KEY = Key.create("jshell.editor.toolbar");
 
+  @Nullable
+  @Override
+  public ConfigurationPane createNotificationPanel(@NotNull VirtualFile file, @NotNull FileEditor fileEditor, @NotNull Project project) {
+    if (!(ScratchFileService.findRootType(file) instanceof JShellRootType)) return null;
+    return new ConfigurationPane(project, file);
+  }
+
+  @NotNull
+  @Override
+  public Key<ConfigurationPane> getKey() {
+    return CONTEXT_KEY;
+  }
+
   public static class ConfigurationPane extends EditorHeaderComponent {
     private final Alarm myUpdateAlarm = new Alarm(Alarm.ThreadToUse.SWING_THREAD);
     private final JrePathEditor myJreEditor;
     private final ConfigurationModuleSelector myModuleSelector;
     private MessageBusConnection myBusConnection;
+    private VirtualFile myVirtualFile;
 
-    ConfigurationPane(@NotNull Project project) {
-      final DefaultActionGroup actions = new DefaultActionGroup(ExecuteJShellAction.getSharedInstance(), DropJShellStateAction.getSharedInstance());
+    ConfigurationPane(@NotNull Project project, VirtualFile virtualFile) {
+      myVirtualFile = virtualFile;
+      final DefaultActionGroup actions =
+        new DefaultActionGroup(ExecuteJShellAction.getSharedInstance(), DropJShellStateAction.getSharedInstance());
       final ActionToolbar toolbar = ActionManager.getInstance().createActionToolbar("JShellSnippetEditor", actions, true);
 
       myJreEditor = new JrePathEditor(DefaultJreSelector.projectSdk(project));
       myJreEditor.setToolTipText(ExecutionBundle.message("alternative.jre.to.run.jshell"));
       myJreEditor.setPathOrName(null, true);
+      myJreEditor.addActionListener(e -> {
+        myVirtualFile.putUserData(CONTEXT_KEY, this);
+      });
 
       LabeledComponent<ModulesComboBox> modulePane = new LabeledComponent<>();
       ModulesComboBox modulesCombo = new ModulesComboBox();
@@ -62,8 +81,11 @@ public final class SnippetEditorDecorator extends EditorNotifications.Provider<S
       myModuleSelector = new ConfigurationModuleSelector(project, modulesCombo, JavaCompilerBundle.message("whole.project"));
 
       JPanel mainPane = new JPanel(new GridBagLayout());
-      mainPane.add(toolbar.getComponent(), new GridBagConstraints(0, 0, 1, 1, 0.0, 0.0, GridBagConstraints.NORTHWEST, GridBagConstraints.NONE, JBUI.insets(2, 3, 0, 0), 0, 0));
-      mainPane.add(modulePane, new GridBagConstraints(1, 0, 1, 1, 0.0, 0.0, GridBagConstraints.NORTHWEST, GridBagConstraints.NONE, JBUI.insets(2, 3, 0, 0), 0, 0));
+      mainPane.add(toolbar.getComponent(),
+                   new GridBagConstraints(0, 0, 1, 1, 0.0, 0.0, GridBagConstraints.NORTHWEST, GridBagConstraints.NONE,
+                                          JBUI.insets(2, 3, 0, 0), 0, 0));
+      mainPane.add(modulePane, new GridBagConstraints(1, 0, 1, 1, 0.0, 0.0, GridBagConstraints.NORTHWEST, GridBagConstraints.NONE,
+                                                      JBUI.insets(2, 3, 0, 0), 0, 0));
       mainPane.add(myJreEditor, new GridBagConstraints(2, 0, 1, 1, 1.0, 0.0, GridBagConstraints.NORTHWEST, GridBagConstraints.NONE, JBUI.insets(2, 15, 0, 0), 0, 0));
       add(mainPane, BorderLayout.CENTER);
     }
@@ -136,19 +158,6 @@ public final class SnippetEditorDecorator extends EditorNotifications.Provider<S
     }
   }
 
-  @NotNull
-  @Override
-  public Key<ConfigurationPane> getKey() {
-    return CONTEXT_KEY;
-  }
-
-  @Nullable
-  @Override
-  public ConfigurationPane createNotificationPanel(@NotNull VirtualFile file, @NotNull FileEditor fileEditor, @NotNull Project project) {
-    if (!(ScratchFileService.findRootType(file) instanceof JShellRootType)) return null;
-    return new ConfigurationPane(project);
-  }
-
   @Nullable
   public static ConfigurationPane getJShellConfiguration(DataContext context) {
     return getJShellConfiguration(PlatformDataKeys.FILE_EDITOR.getData(context));
@@ -158,4 +167,17 @@ public final class SnippetEditorDecorator extends EditorNotifications.Provider<S
   public static ConfigurationPane getJShellConfiguration(FileEditor fileEditor) {
     return CONTEXT_KEY.get(fileEditor);
   }
+
+  @Nullable
+  public static Sdk getSdk(VirtualFile contentFile) {
+    if (contentFile == null) {
+      return null;
+    }
+    SnippetEditorDecorator.ConfigurationPane configurationPane = contentFile.getUserData(CONTEXT_KEY);
+    if (configurationPane == null) {
+      return null;
+    }
+    return configurationPane.getRuntimeSdk();
+  }
+
 }
