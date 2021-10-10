@@ -59,10 +59,11 @@ import java.util.concurrent.atomic.AtomicReference;
  * @author Eugene Zhuravlev
  */
 public final class JShellHandler {
+  public static final Key<JShellHandler> MARKER_KEY = Key.create("JShell console key");
+  public static final Map<String, Key<JShellHandler>> SDK_KEY_MAP = new HashMap<>();
+  public static final String JSHELL_CONSOLE_KEY = "JShell console key";
   private static final Logger LOG = Logger.getInstance(JShellHandler.class);
   private static final int DEBUG_PORT = -1;
-  public static final Key<JShellHandler> MARKER_KEY = Key.create("JShell console key");
-  public static final String JSHELL_CONSOLE_KEY = "JShell console key";
   private static final Charset ourCharset = StandardCharsets.UTF_8;
 
   private static final Executor EXECUTOR = DefaultRunExecutor.getRunExecutorInstance();
@@ -77,7 +78,6 @@ public final class JShellHandler {
   private final ExecutorService myTaskQueue = SequentialTaskExecutor.createSequentialApplicationPoolExecutor(
     ExecutionBundle.message("jshell.command.queue"));
   private final AtomicReference<Collection<String>> myEvalClasspathRef = new AtomicReference<>(null);
-  private final Sdk mySdk;
 
   private JShellHandler(@NotNull Project project,
                         RunContentDescriptor descriptor,
@@ -88,13 +88,17 @@ public final class JShellHandler {
     myRunContent = descriptor;
     myConsoleView = view;
     myProcess = handler;
-    mySdk = SnippetEditorDecorator.getSdk(contentFile);
 
     final PipedInputStream is = new PipedInputStream();
     final OutputStreamWriter readerSink = new OutputStreamWriter(new PipedOutputStream(is), StandardCharsets.UTF_8);
     myMessageReader = new MessageReader<>(is, Response.class);
     myMessageWriter = new MessageWriter<>(handler.getProcessInput());
 
+    Sdk sdk = SnippetEditorDecorator.getSdk(contentFile);
+    final Key<JShellHandler> key;
+    if (sdk != null) {
+      key = getOrCreateKeyBySdk(sdk);
+    }
     handler.addProcessListener(new ProcessAdapter() {
       @Override
       public void onTextAvailable(@NotNull ProcessEvent event, @NotNull Key outputType) {
@@ -108,7 +112,9 @@ public final class JShellHandler {
           }
         }
         else {
-          myConsoleView.print(event.getText(), outputType == ProcessOutputTypes.STDERR? ConsoleViewContentType.ERROR_OUTPUT : ConsoleViewContentType.SYSTEM_OUTPUT);
+          myConsoleView.print(event.getText(), outputType == ProcessOutputTypes.STDERR
+                                               ? ConsoleViewContentType.ERROR_OUTPUT
+                                               : ConsoleViewContentType.SYSTEM_OUTPUT);
         }
       }
 
@@ -116,7 +122,7 @@ public final class JShellHandler {
       public void processTerminated(@NotNull ProcessEvent event) {
         if (getAssociatedHandler(contentFile) == JShellHandler.this) {
           // process terminated either by closing file or by close action
-          contentFile.putUserData(createKey(mySdk), null);
+          contentFile.putUserData(key, null);
           try {
             readerSink.close();
           }
@@ -135,26 +141,140 @@ public final class JShellHandler {
         }
       }
     });
-
-    contentFile.putUserData(createKey(mySdk), this);
+    contentFile.putUserData(key, this);
     view.attachToProcess(handler);
+  }
+
+  public void stop() {
+    myProcess.destroyProcess(); // use force
+    RunContentManager.getInstance(myProject).removeRunContent(EXECUTOR, myRunContent);
+  }
+
+  public void toFront() {
+    RunContentManager.getInstance(myProject).toFrontRunContent(EXECUTOR, myRunContent);
+  }
+
+  @Nullable
+  public Future<Response> evaluate(@NotNull String code) {
+    return StringUtil.isEmptyOrSpaces(code)
+           ? null
+           : myTaskQueue.submit(() -> sendInput(new Request(nextUid(), Request.Command.EVAL, code)));
+  }
+
+  public void dropState() {
+    myTaskQueue.execute(() -> sendInput(new Request(nextUid(), Request.Command.DROP_STATE, null)));
+  }
+
+  @Nullable
+  private Response sendInput(final Request request) {
+    final boolean alive = !myProcess.isProcessTerminating() && !myProcess.isProcessTerminated();
+    if (alive) {
+      // consume evaluation classpath, if any
+      final Collection<String> cp = myEvalClasspathRef.getAndSet(null);
+      if (cp != null) {
+        for (String path : cp) {
+          request.addClasspathItem(path);
+        }
+      }
+      UIUtil.invokeLaterIfNeeded(() ->
+                                   myConsoleView.performWhenNoDeferredOutput(() -> {
+                                     try {
+                                       myMessageWriter.send(request);
+                                     }
+                                     catch (IOException e) {
+                                       LOG.info(e);
+                                     }
+                                   }));
+    }
+    final StringBuilder stdOut = new StringBuilder();
+    Response response = null;
+    try {
+      response = myMessageReader.receive(unparsedText -> stdOut.append(unparsedText));
+      return response;
+    }
+    catch (IOException e) {
+      LOG.info(e);
+    }
+    finally {
+      renderResponse(request, response, stdOut.toString());
+    }
+    return null;
+  }
+
+  private void renderResponse(Request request, @Nullable Response response, String stdOut) {
+    //myConsoleView.print("\n-------------------evaluation " + response.getUid() + "------------------------", ConsoleViewContentType.NORMAL_OUTPUT);
+    if (response != null) {
+      final List<Event> events = response.getEvents();
+      if (events != null) {
+        if (request.getCommand() == Request.Command.DROP_STATE) {
+          int droppedCount = 0;
+          for (Event event : events) {
+            final CodeSnippet.Status prevStatus = event.getPreviousStatus();
+            final CodeSnippet.Status status = event.getStatus();
+            if (event.getSnippet() != null && prevStatus != status && status == CodeSnippet.Status.DROPPED) {
+              droppedCount++;
+            }
+          }
+          JShellDiagnostic.notifyInfo(JavaCompilerBundle.message("jshell.dropped.x.code.snippets", droppedCount), myProject);
+        }
+        else {
+          for (Event event : events) {
+            if (event.getCauseSnippet() == null) {
+              final String exception = event.getExceptionText();
+              if (!StringUtil.isEmptyOrSpaces(exception)) {
+                myConsoleView.print("\n" + exception, ConsoleViewContentType.SYSTEM_OUTPUT);
+              }
+              final String diagnostic = event.getDiagnostic();
+              if (!StringUtil.isEmptyOrSpaces(diagnostic)) {
+                myConsoleView.print("\n" + diagnostic, ConsoleViewContentType.SYSTEM_OUTPUT);
+              }
+
+              final String descr = getEventDescription(event);
+              if (!StringUtil.isEmptyOrSpaces(descr)) {
+                myConsoleView.print("\n" + descr, ConsoleViewContentType.SYSTEM_OUTPUT);
+              }
+              final CodeSnippet snippet = event.getSnippet();
+              final String value = snippet != null && !snippet.getSubKind().hasValue() ? null : event.getValue();
+              if (value != null) {
+                myConsoleView.print(" = " + (value.isEmpty() ? "\"\"" : value), ConsoleViewContentType.NORMAL_OUTPUT);
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if (!StringUtil.isEmpty(stdOut)) {
+      //myConsoleView.print("\n-----evaluation output-----\n", ConsoleViewContentType.NORMAL_OUTPUT);
+      myConsoleView.print("\n", ConsoleViewContentType.NORMAL_OUTPUT);
+      // delegate unparsed text directly to console
+      if (!"\n".equals(stdOut) /*hack to ignore possible empty line before 'message-begin' merker*/) {
+        myConsoleView.print(stdOut, ConsoleViewContentType.NORMAL_OUTPUT);
+      }
+    }
   }
 
   @Nullable
   public static JShellHandler getAssociatedHandler(VirtualFile contentFile) {
     Sdk sdk = SnippetEditorDecorator.getSdk(contentFile);
-    if (sdk == null) return null;
-    return contentFile.getUserData(createKey(sdk));
+    if (sdk == null) {
+      return null;
+    }
+    Key<JShellHandler> key = getOrCreateKeyBySdk(sdk);
+    return contentFile.getUserData(key);
   }
-
 
   public static @NotNull JShellHandler create(@NotNull final Project project,
                                               @NotNull final VirtualFile contentFile,
                                               @Nullable Module module,
-                                              @Nullable Sdk alternateSdk) throws Exception{
-    final OSProcessHandler processHandler = launchProcess(project, module, alternateSdk);
+                                              @Nullable Sdk alternateSdk) throws Exception {
+    final Sdk sdk = alternateSdk != null ? alternateSdk :
+                    module != null ? ModuleRootManager.getInstance(module).getSdk() :
+                    ProjectRootManager.getInstance(project).getProjectSdk();
 
-    final String title = JShellDiagnostic.TITLE + " " + contentFile.getNameWithoutExtension();
+    final OSProcessHandler processHandler = launchProcess(project, module, sdk);
+
+    final String title = JShellDiagnostic.TITLE + " " + contentFile.getNameWithoutExtension() + "_" + sdk.getVersionString();
 
     final ConsoleViewImpl consoleView = new MyConsoleView(project);
     final RunContentDescriptor descriptor = new RunContentDescriptor(consoleView, processHandler, new JPanel(new BorderLayout()), title);
@@ -206,14 +326,12 @@ public final class JShellHandler {
   // todo: if we include project classes, make sure they are compiled
   private static OSProcessHandler launchProcess(@NotNull Project project,
                                                 @Nullable Module module,
-                                                @Nullable Sdk alternateSdk) throws Exception{
-    final Sdk sdk = alternateSdk != null? alternateSdk :
-                    module != null? ModuleRootManager.getInstance(module).getSdk() :
-                    ProjectRootManager.getInstance(project).getProjectSdk();
+                                                @Nullable Sdk sdk) throws Exception {
+
     if (sdk == null || !(sdk.getSdkType() instanceof JavaSdkType)) {
       throw new ExecException(
         (sdk != null ? "Expected Java SDK" : " SDK is not configured") +
-        (module != null? " for module " + module.getName() : " for project " + project.getName())
+        (module != null ? " for module " + module.getName() : " for project " + project.getName())
       );
     }
     final JavaSdkVersion sdkVersion = JavaSdkVersionUtil.getJavaSdkVersion(sdk);
@@ -289,123 +407,17 @@ public final class JShellHandler {
   }
 
   private static String findFrontEndLibrary() {
-    final String path = PathManager.getResourceRoot(JShellHandler.class.getClassLoader(), "com/intellij/execution/jshell/frontend/Marker.class");
-    return path != null? path : JSHELL_FRONTEND_JAR;
+    final String path =
+      PathManager.getResourceRoot(JShellHandler.class.getClassLoader(), "com/intellij/execution/jshell/frontend/Marker.class");
+    return path != null ? path : JSHELL_FRONTEND_JAR;
   }
 
   private static String getLibPath(final Class<?> aClass) {
     return PathManager.getResourceRoot(aClass, "/" + aClass.getName().replace('.', '/') + ".class");
   }
 
-  public void stop() {
-    myProcess.destroyProcess(); // use force
-    RunContentManager.getInstance(myProject).removeRunContent(EXECUTOR, myRunContent);
-  }
-
-  public void toFront() {
-    RunContentManager.getInstance(myProject).toFrontRunContent(EXECUTOR, myRunContent);
-  }
-
-  @Nullable
-  public Future<Response> evaluate(@NotNull String code) {
-    return StringUtil.isEmptyOrSpaces(code) ? null : myTaskQueue.submit(() -> sendInput(new Request(nextUid(), Request.Command.EVAL, code)));
-  }
-
-  public void dropState() {
-    myTaskQueue.execute(() -> sendInput(new Request(nextUid(), Request.Command.DROP_STATE, null)));
-  }
-
   private static String nextUid() {
     return UUID.randomUUID().toString();
-  }
-
-  @Nullable
-  private Response sendInput(final Request request) {
-    final boolean alive = !myProcess.isProcessTerminating() && !myProcess.isProcessTerminated();
-    if (alive) {
-      // consume evaluation classpath, if any
-      final Collection<String> cp = myEvalClasspathRef.getAndSet(null);
-      if (cp != null) {
-        for (String path : cp) {
-          request.addClasspathItem(path);
-        }
-      }
-      UIUtil.invokeLaterIfNeeded(() ->
-      myConsoleView.performWhenNoDeferredOutput(() -> {
-        try {
-          myMessageWriter.send(request);
-        }
-        catch (IOException e) {
-          LOG.info(e);
-        }
-      }));
-    }
-    final StringBuilder stdOut = new StringBuilder();
-    Response response = null;
-    try {
-      response = myMessageReader.receive(unparsedText -> stdOut.append(unparsedText));
-      return response;
-    }
-    catch (IOException e) {
-      LOG.info(e);
-    }
-    finally {
-      renderResponse(request, response, stdOut.toString());
-    }
-    return null;
-  }
-
-  private void renderResponse(Request request, @Nullable Response response, String stdOut) {
-    //myConsoleView.print("\n-------------------evaluation " + response.getUid() + "------------------------", ConsoleViewContentType.NORMAL_OUTPUT);
-    if (response != null) {
-      final List<Event> events = response.getEvents();
-      if (events != null) {
-        if (request.getCommand() == Request.Command.DROP_STATE) {
-          int droppedCount = 0;
-          for (Event event : events) {
-            final CodeSnippet.Status prevStatus = event.getPreviousStatus();
-            final CodeSnippet.Status status = event.getStatus();
-            if (event.getSnippet() != null && prevStatus != status && status == CodeSnippet.Status.DROPPED) {
-              droppedCount++;
-            }
-          }
-          JShellDiagnostic.notifyInfo(JavaCompilerBundle.message("jshell.dropped.x.code.snippets", droppedCount), myProject);
-        }
-        else {
-          for (Event event : events) {
-            if (event.getCauseSnippet() == null) {
-              final String exception = event.getExceptionText();
-              if (!StringUtil.isEmptyOrSpaces(exception)) {
-                myConsoleView.print("\n" + exception, ConsoleViewContentType.SYSTEM_OUTPUT);
-              }
-              final String diagnostic = event.getDiagnostic();
-              if (!StringUtil.isEmptyOrSpaces(diagnostic)) {
-                myConsoleView.print("\n" + diagnostic, ConsoleViewContentType.SYSTEM_OUTPUT);
-              }
-
-              final String descr = getEventDescription(event);
-              if (!StringUtil.isEmptyOrSpaces(descr)) {
-                myConsoleView.print("\n" + descr, ConsoleViewContentType.SYSTEM_OUTPUT);
-              }
-              final CodeSnippet snippet = event.getSnippet();
-              final String value = snippet != null && !snippet.getSubKind().hasValue()? null : event.getValue();
-              if (value != null) {
-                myConsoleView.print(" = " + (value.isEmpty()? "\"\"" : value), ConsoleViewContentType.NORMAL_OUTPUT);
-              }
-            }
-          }
-        }
-      }
-    }
-
-    if (!StringUtil.isEmpty(stdOut)) {
-      //myConsoleView.print("\n-----evaluation output-----\n", ConsoleViewContentType.NORMAL_OUTPUT);
-      myConsoleView.print("\n", ConsoleViewContentType.NORMAL_OUTPUT);
-      // delegate unparsed text directly to console
-      if (!"\n".equals(stdOut) /*hack to ignore possible empty line before 'message-begin' merker*/) {
-        myConsoleView.print(stdOut, ConsoleViewContentType.NORMAL_OUTPUT);
-      }
-    }
   }
 
   private static String getEventDescription(Event event) {
@@ -425,7 +437,7 @@ public final class JShellHandler {
     String actionLabel;
     if (event.getPreviousStatus() == CodeSnippet.Status.NONEXISTENT && status.isDefined()) {
       if (subKind == CodeSnippet.SubKind.VAR_DECLARATION_WITH_INITIALIZER_SUBKIND ||
-          /*subKind == CodeSnippet.SubKind.TEMP_VAR_EXPRESSION_SUBKIND ||*/
+        /*subKind == CodeSnippet.SubKind.TEMP_VAR_EXPRESSION_SUBKIND ||*/
           !subKind.isExecutable()) {
         actionLabel = "Defined";
       }
@@ -433,7 +445,7 @@ public final class JShellHandler {
         actionLabel = "";
       }
     }
-    else if (status == CodeSnippet.Status.REJECTED){
+    else if (status == CodeSnippet.Status.REJECTED) {
       actionLabel = "Rejected";
     }
     else if (status == CodeSnippet.Status.DROPPED) {
@@ -461,14 +473,17 @@ public final class JShellHandler {
         kindLabel = "class";
       }
     }
-    else if (kind == CodeSnippet.Kind.VAR){
+    else if (kind == CodeSnippet.Kind.VAR) {
       kindLabel = subKind == CodeSnippet.SubKind.TEMP_VAR_EXPRESSION_SUBKIND ? ""/*"temp var"*/ : "field";
     }
     else if (kind == CodeSnippet.Kind.METHOD) {
       kindLabel = "method";
     }
     else if (kind == CodeSnippet.Kind.IMPORT) {
-      kindLabel = subKind == CodeSnippet.SubKind.STATIC_IMPORT_ON_DEMAND_SUBKIND || subKind == CodeSnippet.SubKind.SINGLE_STATIC_IMPORT_SUBKIND ? "static import" : "import";
+      kindLabel =
+        subKind == CodeSnippet.SubKind.STATIC_IMPORT_ON_DEMAND_SUBKIND || subKind == CodeSnippet.SubKind.SINGLE_STATIC_IMPORT_SUBKIND
+        ? "static import"
+        : "import";
     }
     else {
       kindLabel = "";
@@ -485,6 +500,17 @@ public final class JShellHandler {
     descr.append(presentation);
 
     return descr.toString();
+  }
+
+  private static Key<JShellHandler> getOrCreateKeyBySdk(Sdk sdk) {
+    String sdkVersionString = sdk.getVersionString();
+    Key<JShellHandler> key = SDK_KEY_MAP.get(sdkVersionString);
+    if (key == null) {
+      Key<JShellHandler> newKey = Key.create(JSHELL_CONSOLE_KEY + sdkVersionString);
+      SDK_KEY_MAP.put(sdkVersionString, newKey);
+      return newKey;
+    }
+    return key;
   }
 
   private static class MyConsoleView extends ConsoleViewImpl {
@@ -514,9 +540,5 @@ public final class JShellHandler {
     public synchronized Throwable fillInStackTrace() {
       return this;
     }
-  }
-
-  private static Key<JShellHandler> createKey(Sdk sdk) {
-    return Key.create(JSHELL_CONSOLE_KEY + sdk.getVersionString());
   }
 }
