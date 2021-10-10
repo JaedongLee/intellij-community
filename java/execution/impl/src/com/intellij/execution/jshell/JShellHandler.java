@@ -95,10 +95,7 @@ public final class JShellHandler {
     myMessageWriter = new MessageWriter<>(handler.getProcessInput());
 
     Sdk sdk = SnippetEditorDecorator.getSdk(contentFile);
-    final Key<JShellHandler> key;
-    if (sdk != null) {
-      key = getOrCreateKeyBySdk(sdk);
-    }
+    final Key<JShellHandler> key = getOrCreateKeyBySdk(sdk);
     handler.addProcessListener(new ProcessAdapter() {
       @Override
       public void onTextAvailable(@NotNull ProcessEvent event, @NotNull Key outputType) {
@@ -502,7 +499,8 @@ public final class JShellHandler {
     return descr.toString();
   }
 
-  private static Key<JShellHandler> getOrCreateKeyBySdk(Sdk sdk) {
+  private static Key<JShellHandler> getOrCreateKeyBySdk(@Nullable Sdk sdk) {
+
     String sdkVersionString = sdk.getVersionString();
     Key<JShellHandler> key = SDK_KEY_MAP.get(sdkVersionString);
     if (key == null) {
